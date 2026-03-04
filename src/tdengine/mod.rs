@@ -123,7 +123,13 @@ pub async fn ensure_table_schema(client: &taos::Taos) -> anyhow::Result<()> {
         qw_fan DOUBLE,                 -- 反向无功总电能
         sw DOUBLE,                     -- 总视在电能
 
-        /* === F. 流体：水/气/热 (兼容设计) === */
+        /* === F. 分时能耗 (FLOAT) === */
+        peak_energy FLOAT,             -- 尖峰时段能耗
+        high_energy FLOAT,             -- 高峰时段能耗
+        flat_energy FLOAT,             -- 平时段能耗
+        valley_energy FLOAT,           -- 谷时段能耗
+
+        /* === G. 流体：水/气/热 (兼容设计) === */
         st DOUBLE,                     -- 结算累计量
         st_raw DOUBLE,                 -- 原始累计量
         fr FLOAT,                      -- 瞬时流速
@@ -132,7 +138,7 @@ pub async fn ensure_table_schema(client: &taos::Taos) -> anyhow::Result<()> {
         tp FLOAT,                      -- 流体温度
         pr FLOAT,                      -- 流体压力
 
-        /* === G. 机械振动 (FLOAT) === */
+        /* === H. 机械振动 (FLOAT) === */
         dx FLOAT, dy FLOAT, dz FLOAT,  -- 位移
         vx FLOAT, vy FLOAT, vz FLOAT   -- 速度
 

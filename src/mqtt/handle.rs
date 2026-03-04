@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use once_cell::sync::OnceCell;
-
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use serde::Deserialize;
 
 use crate::mysqldb;
 use crate::tdengine::{get_tdengine_client};
 use taos::AsyncQueryable;
 use md5;
 use crate::tdengine;
+use uuid::Uuid;
+use anyhow;
 
 
 
@@ -118,6 +119,12 @@ fn get_param_mapping() -> &'static HashMap<&'static str, &'static str> {
             // 8. 其他标识
             // ==========================
             ("energy_type", "energy_type"), ("能源类型标识", "energy_type"),
+
+            // 尖峰平谷预留字段
+            ("peak", "peak"), ("尖", "peak"), ("尖峰", "peak"),
+            ("flat", "flat"), ("平", "flat"), ("峰平", "flat"),
+            ("valley", "valley"), ("谷", "valley"), ("谷段", "valley"),
+            ("shoulder", "shoulder"), ("峰", "shoulder"), ("峰段", "shoulder"),
         ])
     })
 }
@@ -184,6 +191,18 @@ struct MqttMessage {
     pKey: String,              // 主键
     sn: String,                // 设备序列号
     ts: i64,                   // 时间戳
+}
+
+// 缓存数据结构
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedData {
+    id: String,                // 唯一标识
+    device_name: String,       // 设备名
+    energy_type: i32,          // 能源类型
+    gateway_name: String,       // 网关名
+    timestamp: i64,            // 时间戳
+    data_map: HashMap<String, f64>,  // 数据映射
+    created_at: i64,           // 缓存时间
 }
 
 
@@ -262,7 +281,17 @@ pub async fn handle_data(_topic: &str, payload: &str) -> Result<(), Box<dyn std:
                         .ok_or_else(|| anyhow::anyhow!("Tdengine client not initialized"))?;
 
                     if let Err(e) = client.query(&sql).await {
-                        eprintln!("写入 TDengine 失败: {}", e);
+                        let error_msg = format!("{}", e);
+                        eprintln!("写入 TDengine 失败: {}", error_msg);
+                        
+                        // 检查是否是 "Sync leader is restoring" 错误
+                        if error_msg.contains("Sync leader is restoring") || error_msg.contains("0x0914") {
+                            println!("检测到 TDengine 初始化中，缓存数据...");
+                            // 缓存数据到 Redis
+                            if let Err(cache_err) = cache_data(device_name, energy_type, gateway_name, message.ts, &data_map).await {
+                                eprintln!("缓存数据失败: {}", cache_err);
+                            }
+                        }
                         continue; // 跳过当前设备处理
                     }
 
@@ -297,4 +326,173 @@ fn format_timestamp(timestamp: i64) -> String {
         },
         None => "无效时间戳".to_string(),
     }
+}
+
+// 缓存数据到 Redis
+async fn cache_data(device_name: &str, energy_type: i32, gateway_name: &str, timestamp: i64, data_map: &HashMap<String, f64>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cached_data = CachedData {
+        id: Uuid::new_v4().to_string(),
+        device_name: device_name.to_string(),
+        energy_type,
+        gateway_name: gateway_name.to_string(),
+        timestamp,
+        data_map: data_map.clone(),
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    
+    let json_data = serde_json::to_string(&cached_data)?;
+    let cache_key = format!("tdengine:cache:{}:{}", device_name, cached_data.id);
+    
+    // 设置缓存，过期时间为 7 天
+    crate::redis::set_ex(&cache_key, &json_data, 7 * 24 * 3600).await?;
+    
+    // 添加到缓存列表，便于批量处理
+    let list_key = "tdengine:cache:list";
+    crate::redis::lpush(&list_key, &cache_key).await?;
+    
+    println!("数据已缓存到Redis: {} (设备: {})", cached_data.id, device_name);
+    
+    Ok(())
+}
+
+// 从 Redis 获取所有缓存数据
+async fn get_all_cached_data() -> Result<Vec<CachedData>, Box<dyn std::error::Error + Send + Sync>> {
+    let list_key = "tdengine:cache:list";
+    let cache_keys: Vec<String> = crate::redis::lrange(&list_key, 0, -1).await?
+        .into_iter()
+        .filter_map(|k| k)
+        .collect();
+    
+    let mut cached_data_list = Vec::new();
+    
+    for key in cache_keys {
+        if let Some(json_data) = crate::redis::get_value(&key).await? {
+            if let Ok(cached_data) = serde_json::from_str::<CachedData>(&json_data) {
+                cached_data_list.push(cached_data);
+            }
+        }
+    }
+    
+    Ok(cached_data_list)
+}
+
+// 从 Redis 删除缓存数据
+async fn remove_cached_data(cache_id: &str, device_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cache_key = format!("tdengine:cache:{}:{}", device_name, cache_id);
+    let list_key = "tdengine:cache:list";
+    
+    // 从列表中移除
+    crate::redis::lrem(&list_key, 1, &cache_key).await?;
+    // 删除缓存
+    crate::redis::del(&cache_key).await?;
+    
+    Ok(())
+}
+
+// 检查 TDengine 可用性
+async fn check_tdengine_available() -> bool {
+    if let Some(client) = get_tdengine_client() {
+        match client.query("SELECT server_status()").await {
+            Ok(_) => return true,
+            Err(e) => {
+                eprintln!("TDengine 检查失败: {}", e);
+                return false;
+            }
+        }
+    }
+    false
+}
+
+// 检查缓存数据数量并触发告警
+async fn check_cache_size() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let list_key = "tdengine:cache:list";
+    let cache_keys: Vec<String> = crate::redis::lrange(&list_key, 0, -1).await?
+        .into_iter()
+        .filter_map(|k| k)
+        .collect();
+    
+    let cache_count = cache_keys.len();
+    
+    // 当缓存数据超过阈值时触发告警
+    if cache_count > 1000 {
+        eprintln!("⚠️  缓存数据数量超过阈值: {} 条，请检查 TDengine 状态", cache_count);
+        // 这里可以添加更复杂的告警逻辑，比如发送邮件或短信
+    }
+    
+    // 检查缓存数据是否过期（超过7天）
+    let now = chrono::Utc::now().timestamp();
+    let expired_threshold = now - 7 * 24 * 3600;
+    
+    for key in cache_keys {
+        if let Some(json_data) = crate::redis::get_value(&key).await? {
+            if let Ok(cached_data) = serde_json::from_str::<CachedData>(&json_data) {
+                if cached_data.created_at < expired_threshold {
+                    eprintln!("删除过期缓存数据: {} (设备: {})", cached_data.id, cached_data.device_name);
+                    crate::redis::del(&key).await?;
+                    crate::redis::lrem(&list_key, 1, &key).await?;
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// 重试写入缓存数据
+pub async fn retry_cached_data() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 检查缓存大小并触发告警
+    if let Err(e) = check_cache_size().await {
+        eprintln!("检查缓存大小失败: {}", e);
+    }
+    
+    // 检查 TDengine 是否可用
+    if !check_tdengine_available().await {
+        return Ok(());
+    }
+    
+    // 获取所有缓存数据
+    let cached_data_list = get_all_cached_data().await?;
+    if cached_data_list.is_empty() {
+        return Ok(());
+    }
+    
+    println!("开始重试写入 {} 条缓存数据...", cached_data_list.len());
+    
+    let client = get_tdengine_client()
+        .ok_or_else(|| anyhow::anyhow!("Tdengine client not initialized"))?;
+    
+    let mut success_count = 0;
+    let mut fail_count = 0;
+    
+    for cached_data in cached_data_list {
+        let table_suffix = format!("{:x}", md5::compute(cached_data.device_name.as_bytes()));
+        let table_name = format!("d_{}", table_suffix);
+        let stable_name = tdengine::TDENGINE_CONFIG.get().unwrap().stable_name.clone();
+        let columns: Vec<&str> = cached_data.data_map.keys().map(|k| k.as_str()).collect();
+        let values: Vec<String> = cached_data.data_map.values().map(|v| v.to_string()).collect();
+        
+        let sql = format!(
+            "INSERT INTO {} USING {} TAGS ('{}', '{}') (ts, {}) VALUES ({}, {})",
+            table_name,
+            stable_name,
+            cached_data.device_name,
+            cached_data.energy_type,
+            columns.join(", "),
+            cached_data.timestamp * 1000,
+            values.join(", ")
+        );
+        
+        if let Err(e) = client.query(&sql).await {
+            eprintln!("重试写入失败: {} (设备: {})", e, cached_data.device_name);
+            fail_count += 1;
+        } else {
+            // 写入成功，删除缓存
+            remove_cached_data(&cached_data.id, &cached_data.device_name).await?;
+            success_count += 1;
+        }
+    }
+    
+    println!("重试完成: 成功 {}, 失败 {}", success_count, fail_count);
+    
+    Ok(())
 }

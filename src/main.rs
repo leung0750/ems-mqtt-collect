@@ -1,5 +1,7 @@
 
 use tokio;
+use tokio::time::interval;
+use std::time::Duration;
 
 // 添加conf模块声明
 mod conf;
@@ -37,6 +39,17 @@ async fn main()-> Result<(), Box<dyn std::error::Error + Send + Sync >> {
     // pool.close().await;
     // 移除close调用，保持连接池打开
 
+    // 启动定时重试任务
+    tokio::spawn(async {
+        let mut interval = interval(Duration::from_secs(30)); // 每30秒检查一次
+        loop {
+            interval.tick().await;
+            if let Err(e) = mqtt::handle::retry_cached_data().await {
+                eprintln!("重试缓存数据失败: {}", e);
+            }
+        }
+    });
+    
     mqtt::client::start().await?;
     Ok(())
 }

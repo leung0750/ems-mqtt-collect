@@ -65,3 +65,43 @@ pub async fn set_value(key: &str, value: &str) -> RedisResult<()> {
         Err(redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "Redis client not initialized")))
     }
 }
+
+pub async fn lpush(key: &str, value: &str) -> RedisResult<()> {
+    if let Some(client) = get_redis_client() {
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        redis::cmd("LPUSH").arg(key).arg(value).query_async::<_, ()>(&mut conn).await?;
+        Ok(())
+    } else {
+        Err(redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "Redis client not initialized")))
+    }
+}
+
+pub async fn lrange(key: &str, start: isize, stop: isize) -> RedisResult<Vec<Option<String>>> {
+    if let Some(client) = get_redis_client() {
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        let values: Vec<Option<String>> = redis::cmd("LRANGE").arg(key).arg(start).arg(stop).query_async(&mut conn).await?;
+        Ok(values)
+    } else {
+        Err(redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "Redis client not initialized")))
+    }
+}
+
+pub async fn lrem(key: &str, count: i32, value: &str) -> RedisResult<()> {
+    if let Some(client) = get_redis_client() {
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        redis::cmd("LREM").arg(key).arg(count).arg(value).query_async::<_, ()>(&mut conn).await?;
+        Ok(())
+    } else {
+        Err(redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "Redis client not initialized")))
+    }
+}
+
+pub async fn del(key: &str) -> RedisResult<()> {
+    if let Some(client) = get_redis_client() {
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        redis::cmd("DEL").arg(key).query_async::<_, ()>(&mut conn).await?;
+        Ok(())
+    } else {
+        Err(redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "Redis client not initialized")))
+    }
+}

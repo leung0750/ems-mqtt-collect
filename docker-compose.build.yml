@@ -1,0 +1,23 @@
+services:
+  builder:
+    image: rust:latest
+    container_name: rust_builder
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    command: >
+      sh -c "
+        apt-get update &&
+        apt-get install -y pkg-config libssl-dev &&
+        cargo build --release &&
+        mkdir -p /app/linux &&
+        cp /app/target/release/mqtt_collect /app/linux/ &&
+        echo 'Build completed! Output: ./linux/mqtt_collect'
+      "
+    restart: "no"
+
+volumes:
+  cargo-cache:
+  target-cache:

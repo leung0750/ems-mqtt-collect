@@ -16,3 +16,4 @@ taos = { version = "*", default-features = false, features = ["ws"] }
 anyhow = "1.0"
 md5 = "0.8.0"
 redis = { version = "0.25.3", features = ["tokio-comp", "connection-manager"] }
+uuid = { version = "1.7.0", features = ["v4"] }
