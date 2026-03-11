@@ -124,8 +124,8 @@ pub async fn ensure_table_schema(client: &taos::Taos) -> anyhow::Result<()> {
         sw DOUBLE,                     -- 总视在电能
 
         /* === F. 分时能耗 (FLOAT) === */
-        peak_energy FLOAT,             -- 尖峰时段能耗
-        high_energy FLOAT,             -- 高峰时段能耗
+        peak_plus_energy FLOAT,             -- 尖峰时段能耗
+        peak_energy FLOAT,             -- 高峰时段能耗
         flat_energy FLOAT,             -- 平时段能耗
         valley_energy FLOAT,           -- 谷时段能耗
 
