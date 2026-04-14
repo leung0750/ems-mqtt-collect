@@ -1,55 +1,59 @@
-
-use tokio;
-use tokio::time::interval;
 use std::time::Duration;
 
-// 添加conf模块声明
+use tokio::time::interval;
+
+mod alarm;
 mod conf;
-// 修改导入路径，指向正确的模块位置
 mod mqtt;
 mod mysqldb;
-mod tdengine;
+mod param_mapping;
 mod redis;
+mod tdengine;
 
 #[tokio::main]
-async fn main()-> Result<(), Box<dyn std::error::Error + Send + Sync >> {
-    // 初始化redis连接
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Initializing Redis connection...");
     let _ = redis::init_redis().await?;
     println!("Redis connection initialized successfully");
-    
-    // 测试Redis连接
-    println!("Testing Redis connection...");
-    let _redis_client = redis::get_redis_client().unwrap();
-    println!("Redis connection test passed");
-    
-    // 初始化Tdengine连接
-    println!("Initializing Tdengine connection...");
-    let _ = tdengine::init_tdengine().await?;
-    println!("Tdengine connection initialized successfully");
-    
-    // 测试Tdengine连接
-    println!("Testing Tdengine connection...");
-    tdengine::test_connection().await?;
-    println!("Tdengine connection test passed");
-    
-    // 使用正确的模块路径调用client函数
-    // let pool = mysqldb::get_pool().await?;
-    // println!("MySQL pool connected: {:?}", pool);
-    // pool.close().await;
-    // 移除close调用，保持连接池打开
 
-    // 启动定时重试任务
+    println!("Initializing param mapping cache...");
+    if let Err(err) = param_mapping::init_param_mapping().await {
+        eprintln!("init param mapping failed: {}", err);
+    }
+
+    println!("Initializing TDengine connection...");
+    let _ = tdengine::init_tdengine().await?;
+    tdengine::test_connection().await?;
+    println!("TDengine connection initialized successfully");
+
+    if let Err(err) = mqtt::handle::refresh_energy_type_cache().await {
+        eprintln!("refresh energy type cache on startup failed: {}", err);
+    }
+
+    if let Err(err) = mqtt::handle::retry_cached_data().await {
+        eprintln!("retry cached TDengine data on startup failed: {}", err);
+    }
+
     tokio::spawn(async {
-        let mut interval = interval(Duration::from_secs(30)); // 每30秒检查一次
+        let mut ticker = interval(Duration::from_secs(30));
         loop {
-            interval.tick().await;
-            if let Err(e) = mqtt::handle::retry_cached_data().await {
-                eprintln!("重试缓存数据失败: {}", e);
+            ticker.tick().await;
+            if let Err(err) = mqtt::handle::retry_cached_data().await {
+                eprintln!("retry cached TDengine data failed: {}", err);
             }
         }
     });
-    
+
+    tokio::spawn(async {
+        let mut ticker = interval(Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            if let Err(err) = mqtt::handle::refresh_energy_type_cache().await {
+                eprintln!("refresh energy type cache failed: {}", err);
+            }
+        }
+    });
+
     mqtt::client::start().await?;
     Ok(())
 }

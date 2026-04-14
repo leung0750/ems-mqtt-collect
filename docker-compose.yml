@@ -1,0 +1,18 @@
+services:
+  mqtt_collect:
+    image: debian:12-slim
+    container_name: mqtt_collect
+    network_mode: host
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./mqtt_collect:/app/mqtt_collect
+      - ./conf.ini:/app/conf.ini
+    working_dir: /app
+    command: ["sh", "-c", "apt-get update && apt-get install -y libssl3 && chmod +x mqtt_collect && ./mqtt_collect"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep mqtt_collect || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

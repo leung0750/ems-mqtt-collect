@@ -1,10 +1,9 @@
 use crate::conf;
-use serde::Deserialize;
-use taos;
-use taos::{AsyncQueryable,AsyncTBuilder};
-use std::sync::Arc;
+use anyhow::anyhow;
 use once_cell::sync::OnceCell;
-
+use serde::Deserialize;
+use std::sync::{Arc, RwLock};
+use taos::{self, AsyncQueryable, AsyncTBuilder};
 
 #[derive(Debug, Deserialize)]
 pub struct TdengineConfig {
@@ -13,154 +12,442 @@ pub struct TdengineConfig {
     pub username: String,
     pub password: String,
     pub database: String,
-    pub stable_name: String,
+    #[serde(default = "default_origin_stable_name", alias = "stable_name")]
+    pub origin_stable_name: String,
+    #[serde(default = "default_hour_stable_name")]
+    pub hour_stable_name: String,
+    #[serde(default = "default_day_stable_name")]
+    pub day_stable_name: String,
+    #[serde(default = "default_month_stable_name")]
+    pub month_stable_name: String,
+    #[serde(default = "default_subtable_prefix")]
+    pub subtable_prefix: String,
 }
 
-static TDENGINE_CLIENT: OnceCell<Arc<taos::Taos>> = OnceCell::new();
+fn default_origin_stable_name() -> String {
+    "origin".to_string()
+}
+
+fn default_hour_stable_name() -> String {
+    "hour".to_string()
+}
+
+fn default_day_stable_name() -> String {
+    "day".to_string()
+}
+
+fn default_month_stable_name() -> String {
+    "month".to_string()
+}
+
+fn default_subtable_prefix() -> String {
+    "d_".to_string()
+}
+
+static TDENGINE_CLIENT: OnceCell<RwLock<Option<Arc<taos::Taos>>>> = OnceCell::new();
+pub static TDENGINE_CONNECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static LAST_RECONNECT_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 pub static TDENGINE_CONFIG: OnceCell<TdengineConfig> = OnceCell::new();
 
+const RECONNECT_COOLDOWN_SECS: i64 = 10;
+
 pub async fn init_tdengine() -> Result<Arc<taos::Taos>, anyhow::Error> {
-    // 1. 加载并设置全局配置
     let config: TdengineConfig = conf::load_config("TDENGINE")?;
-    TDENGINE_CONFIG.set(config)
-        .map_err(|_| anyhow::anyhow!("Tdengine config already initialized"))?;
-    
-    // 获取配置引用，方便后续使用
-    let config = TDENGINE_CONFIG.get().unwrap();
-    let db_name = &config.database;
+    let _ = TDENGINE_CONFIG.set(config);
 
-    // ==========================================
-    // 第一步：Admin 连接 (无 DB) -> 负责创建数据库
-    // ==========================================
-    let root_dsn = format!("taos://{}:{}@{}:{}", 
-        config.username, config.password, config.host, config.port
-    );
-    println!("Tdengine Admin DSN: {}", root_dsn);
-    
-    let admin_client = taos::TaosBuilder::from_dsn(root_dsn)?.build().await?;
-
-    // 核心修改：直接尝试建库 (利用 IF NOT EXISTS)，不再依赖 USE 报错来判断
-    // 这样代码更简洁，也不容易出错
-    println!("Ensuring database '{}' exists...", db_name);
-    let create_db_sql = format!("CREATE DATABASE IF NOT EXISTS {} PRECISION 'ms' KEEP 3650", db_name);
-    admin_client.query(create_db_sql).await?;
-    
-    // ==========================================
-    // 第二步：App 连接 (有 DB) -> 负责建表和业务
-    // ==========================================
-    // 核心修改：这里必须用 config.database，绝对不能用 stable_name
-    let app_dsn = format!(
-        "taos://{}:{}@{}:{}/{}", 
-        config.username, config.password, config.host, config.port, 
-        config.database // <--- 修正点：这里是数据库名
-    );
-    println!("Tdengine App DSN: {}", app_dsn);
-
-    let app_client = taos::TaosBuilder::from_dsn(app_dsn)?.build().await?;
-    
-    // ==========================================
-    // 第三步：执行 stable.sql (无论库是否存在都要执行)
-    // ==========================================
-    // 使用 app_client 执行，因为它已经连接到了 db_name，无需 USE
+    let config = TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?;
+    let app_client = build_tdengine_client(config).await?;
     ensure_table_schema(&app_client).await?;
+    set_tdengine_client(app_client.clone())?;
 
-    // ==========================================
-    // 第四步：注册全局客户端
-    // ==========================================
-    let app_client = Arc::new(app_client);
-    TDENGINE_CLIENT.set(app_client.clone())
-        .map_err(|_| anyhow::anyhow!("Tdengine client already initialized"))?;
-    
+    TDENGINE_CONNECTED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(app_client)
 }
 
 pub fn get_tdengine_client() -> Option<Arc<taos::Taos>> {
-    TDENGINE_CLIENT.get().cloned()
+    let lock = TDENGINE_CLIENT.get()?;
+    let guard = lock.read().ok()?;
+    guard.clone()
+}
+
+pub fn is_tdengine_connected() -> bool {
+    TDENGINE_CONNECTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn get_origin_stable_name() -> anyhow::Result<String> {
+    Ok(TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?
+        .origin_stable_name
+        .clone())
+}
+
+pub fn get_subtable_name(device_name: &str) -> anyhow::Result<String> {
+    let config = TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?;
+    let digest = format!("{:x}", md5::compute(device_name.as_bytes()));
+    Ok(format!("{}{}", config.subtable_prefix, digest))
+}
+
+pub async fn reconnect_tdengine() -> Result<Arc<taos::Taos>, anyhow::Error> {
+    let now = chrono::Utc::now().timestamp();
+    let last_reconnect = LAST_RECONNECT_TIME.load(std::sync::atomic::Ordering::SeqCst);
+
+    if now - last_reconnect < RECONNECT_COOLDOWN_SECS {
+        return Err(anyhow!("Reconnect in cooldown"));
+    }
+
+    LAST_RECONNECT_TIME.store(now, std::sync::atomic::Ordering::SeqCst);
+
+    let config = TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?;
+    let app_client = build_tdengine_client(config).await?;
+    ensure_table_schema(&app_client).await?;
+    app_client.query("SELECT server_status()").await?;
+    set_tdengine_client(app_client.clone())?;
+
+    TDENGINE_CONNECTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    println!("TDengine reconnect success");
+    Ok(app_client)
 }
 
 pub async fn test_connection() -> Result<(), anyhow::Error> {
-    let client = get_tdengine_client()
-        .ok_or_else(|| anyhow::anyhow!("Tdengine client not initialized"))?;
-    
-    let result = client.query("SELECT server_status()").await?;
-    println!("Tdengine connection test successful: {:?}", result);
-    
+    let client = get_tdengine_client().ok_or_else(|| anyhow!("TDengine client not initialized"))?;
+    client.query("SELECT server_status()").await?;
     Ok(())
 }
 
-/// 在代码中定义表结构并执行创建
-pub async fn ensure_table_schema(client: &taos::Taos) -> anyhow::Result<()> {
-    // 使用 r#""# 语法包裹原始 SQL，保持格式清晰
-    // 我已修正了原 SQL 中的拼写错误 (ennergy_type -> energy_type)
-    let sql = r#"
-    CREATE STABLE IF NOT EXISTS collect_energy (
-        /* === 基础字段 === */
-        ts TIMESTAMP,                  -- [时间戳] 主键
-
-        /* === A. 电力：电压 (FLOAT) === */
-        ua FLOAT, ub FLOAT, uc FLOAT,  -- 相电压
-        uab FLOAT, ubc FLOAT, uac FLOAT, -- 线电压
-
-        /* === B. 电力：电流 (FLOAT) === */
-        ia FLOAT, ib FLOAT, ic FLOAT,  -- 相电流
-        z_i FLOAT,                     -- 零序电流
-
-        /* === C. 电力：功率 (FLOAT) === */
-        pa FLOAT, pb FLOAT, pc FLOAT,  -- 有功功率
-        p  FLOAT,                      -- 总有功
-        q  FLOAT,                      -- 总无功
-        s  FLOAT,                      -- 总视在
-
-        /* === D. 电力：因数与频率 (FLOAT) === */
-        fa FLOAT, fb FLOAT, fc FLOAT,  -- 功率因数
-        f  FLOAT,                      -- 总功率因数
-        hz FLOAT,                      -- 频率
-
-        /* === E. 电力：电能抄表 (DOUBLE - 核心计费) === */
-        pw DOUBLE,                     -- 正向有功总电能 (kWh)
-        pw_fan DOUBLE,                 -- 反向有功总电能
-        qw DOUBLE,                     -- 正向无功总电能
-        qw_fan DOUBLE,                 -- 反向无功总电能
-        sw DOUBLE,                     -- 总视在电能
-
-        /* === F. 分时能耗 (FLOAT) === */
-        peak_plus_energy FLOAT,             -- 尖峰时段能耗
-        peak_energy FLOAT,             -- 高峰时段能耗
-        flat_energy FLOAT,             -- 平时段能耗
-        valley_energy FLOAT,           -- 谷时段能耗
-
-        /* === G. 流体：水/气/热 (兼容设计) === */
-        st DOUBLE,                     -- 结算累计量
-        st_raw DOUBLE,                 -- 原始累计量
-        fr FLOAT,                      -- 瞬时流速
-        sf FLOAT,                      -- 标况流量
-        wf FLOAT,                      -- 工况流量
-        tp FLOAT,                      -- 流体温度
-        pr FLOAT,                      -- 流体压力
-
-        /* === H. 机械振动 (FLOAT) === */
-        dx FLOAT, dy FLOAT, dz FLOAT,  -- 位移
-        vx FLOAT, vy FLOAT, vz FLOAT   -- 速度
-
-    ) TAGS (
-        /* === 标签 (Tags) === */
-        device_id BINARY(50),      -- 设备编号
-        energy_type BINARY(20)     -- 设备类型 (修正了拼写)
+async fn build_tdengine_client(config: &TdengineConfig) -> Result<Arc<taos::Taos>, anyhow::Error> {
+    let root_dsn = format!(
+        "taos://{}:{}@{}:{}",
+        config.username, config.password, config.host, config.port
     );
-    "#;
+    let admin_client = taos::TaosBuilder::from_dsn(root_dsn)?.build().await?;
+    let create_db_sql = format!(
+        "CREATE DATABASE IF NOT EXISTS {} PRECISION 'ms' KEEP 3650",
+        config.database
+    );
+    admin_client.query(create_db_sql).await?;
 
-    println!("Ensuring stable 'collect_energy' schema...");
-    
-    // 执行 SQL
-    match client.query(sql).await {
-        Ok(_) => {
-            println!("✅ Schema check passed (CREATE STABLE IF NOT EXISTS executed).");
-            Ok(())
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to create stable 'collect_energy'.");
-            eprintln!("Error details: {}", e);
-            Err(e.into())
+    let app_dsn = format!(
+        "taos://{}:{}@{}:{}/{}",
+        config.username, config.password, config.host, config.port, config.database
+    );
+    let app_client = taos::TaosBuilder::from_dsn(app_dsn)?.build().await?;
+    Ok(Arc::new(app_client))
+}
+
+fn set_tdengine_client(client: Arc<taos::Taos>) -> Result<(), anyhow::Error> {
+    let lock = TDENGINE_CLIENT.get_or_init(|| RwLock::new(None));
+    let mut guard = lock
+        .write()
+        .map_err(|_| anyhow!("TDengine client lock poisoned"))?;
+    *guard = Some(client);
+    Ok(())
+}
+
+pub async fn ensure_table_schema(client: &taos::Taos) -> anyhow::Result<()> {
+    let config = TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?;
+
+    let origin_sql = format!(
+        r#"
+CREATE STABLE IF NOT EXISTS {} (
+    ts TIMESTAMP,
+    ua DOUBLE,
+    ub DOUBLE,
+    uc DOUBLE,
+    avg_u DOUBLE,
+    uab DOUBLE,
+    ubc DOUBLE,
+    uac DOUBLE,
+    avg_uu DOUBLE,
+    ia DOUBLE,
+    ib DOUBLE,
+    ic DOUBLE,
+    avg_i DOUBLE,
+    z_i DOUBLE,
+    pa DOUBLE,
+    pb DOUBLE,
+    pc DOUBLE,
+    p DOUBLE,
+    q DOUBLE,
+    s DOUBLE,
+    fa DOUBLE,
+    fb DOUBLE,
+    fc DOUBLE,
+    f DOUBLE,
+    hz DOUBLE,
+    pw DOUBLE,
+    pw_fan DOUBLE,
+    qw DOUBLE,
+    qw_fan DOUBLE,
+    sw DOUBLE,
+    peak_plus_energy DOUBLE,
+    peak_energy DOUBLE,
+    flat_energy DOUBLE,
+    valley_energy DOUBLE,
+    st DOUBLE,
+    st_raw DOUBLE,
+    fr DOUBLE,
+    sf DOUBLE,
+    wf DOUBLE,
+    tp DOUBLE,
+    pr DOUBLE,
+    dx DOUBLE,
+    dy DOUBLE,
+    dz DOUBLE,
+    vx DOUBLE,
+    vy DOUBLE,
+    vz DOUBLE
+) TAGS (
+    device_id NCHAR(255),
+    energy_type NCHAR(32)
+);
+"#,
+        config.origin_stable_name
+    );
+
+    let day_sql = format!(
+        r#"
+CREATE STABLE IF NOT EXISTS {} (
+    ts TIMESTAMP,
+    energy DOUBLE,
+    start_val DOUBLE,
+    end_val DOUBLE
+) TAGS (
+    device_id NCHAR(255),
+    energy_type NCHAR(32)
+);
+"#,
+        config.day_stable_name
+    );
+
+    let hour_sql = format!(
+        r#"
+CREATE STABLE IF NOT EXISTS {} (
+    ts TIMESTAMP,
+    energy DOUBLE,
+    start_val DOUBLE,
+    end_val DOUBLE
+) TAGS (
+    device_id NCHAR(255),
+    energy_type NCHAR(32)
+);
+"#,
+        config.hour_stable_name
+    );
+
+    let month_sql = format!(
+        r#"
+CREATE STABLE IF NOT EXISTS {} (
+    ts TIMESTAMP,
+    energy DOUBLE,
+    start_val DOUBLE,
+    end_val DOUBLE
+) TAGS (
+    device_id NCHAR(255),
+    energy_type NCHAR(32)
+);
+"#,
+        config.month_stable_name
+    );
+
+    let hour_ele_stream_sql = format!(
+        r#"
+CREATE STREAM IF NOT EXISTS hour_stream_ele
+INTERVAL(1h) SLIDING(1h)
+FROM {} PARTITION BY tbname, device_id, energy_type
+STREAM_OPTIONS(FILL_HISTORY_FIRST|PRE_FILTER(energy_type = '1'))
+INTO {} (ts, energy, start_val, end_val)
+TAGS (
+  device_id NCHAR(255) AS device_id,
+  energy_type NCHAR(32) AS energy_type
+)
+AS
+SELECT
+  _twstart AS ts,
+  SPREAD(pw) AS energy,
+  FIRST(pw) AS start_val,
+  LAST(pw) AS end_val
+FROM %%tbname
+WHERE _c0 >= _twstart AND _c0 <= _twend
+"#,
+        config.origin_stable_name, config.hour_stable_name
+    );
+
+    let hour_st_stream_sql = format!(
+        r#"
+CREATE STREAM IF NOT EXISTS hour_stream_st
+INTERVAL(1h) SLIDING(1h)
+FROM {} PARTITION BY tbname, device_id, energy_type
+STREAM_OPTIONS(FILL_HISTORY_FIRST|PRE_FILTER(st IS NOT NULL))
+INTO {} (ts, energy, start_val, end_val)
+TAGS (
+  device_id NCHAR(255) AS device_id,
+  energy_type NCHAR(32) AS energy_type
+)
+AS
+SELECT
+  _twstart AS ts,
+  SPREAD(st) AS energy,
+  FIRST(st) AS start_val,
+  LAST(st) AS end_val
+FROM %%tbname
+WHERE _c0 >= _twstart AND _c0 <= _twend
+"#,
+        config.origin_stable_name, config.hour_stable_name
+    );
+
+    let day_stream_sql = format!(
+        r#"
+CREATE STREAM IF NOT EXISTS day_stream
+INTERVAL(1d) SLIDING(1d)
+FROM {} PARTITION BY tbname, device_id, energy_type
+STREAM_OPTIONS(FILL_HISTORY_FIRST)
+INTO {} (ts, energy, start_val, end_val)
+TAGS (
+  device_id NCHAR(255) AS device_id,
+  energy_type NCHAR(32) AS energy_type
+)
+AS
+SELECT
+  _twstart AS ts,
+  SUM(energy) AS energy,
+  FIRST(start_val) AS start_val,
+  LAST(end_val) AS end_val
+FROM %%tbname
+WHERE _c0 >= _twstart AND _c0 <= _twend
+"#,
+        config.hour_stable_name, config.day_stable_name
+    );
+
+    let month_stream_sql = format!(
+        r#"
+CREATE STREAM IF NOT EXISTS month_stream
+PERIOD(1d)
+FROM {} PARTITION BY tbname, device_id, energy_type
+INTO {} (ts, energy, start_val, end_val)
+TAGS (
+  device_id NCHAR(255) AS device_id,
+  energy_type NCHAR(32) AS energy_type
+)
+AS
+SELECT
+  TO_TIMESTAMP(TO_CHAR(_tlocaltime, 'YYYY-MM'), 'YYYY-MM') AS ts,
+  SUM(energy) AS energy,
+  FIRST(start_val) AS start_val,
+  LAST(end_val) AS end_val
+FROM %%tbname
+WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tlocaltime, 'YYYY-MM'), 'YYYY-MM')
+  AND _c0 < TO_TIMESTAMP(TO_CHAR(_tlocaltime + 1n, 'YYYY-MM'), 'YYYY-MM')
+"#,
+        config.day_stable_name, config.month_stable_name
+    );
+
+    upgrade_legacy_streams(client).await?;
+
+    for (name, sql) in [
+        ("origin stable", origin_sql.as_str()),
+        ("hour stable", hour_sql.as_str()),
+        ("day stable", day_sql.as_str()),
+        ("month stable", month_sql.as_str()),
+        ("hour electricity stream", hour_ele_stream_sql.as_str()),
+        ("hour st stream", hour_st_stream_sql.as_str()),
+        ("day stream", day_stream_sql.as_str()),
+        ("month stream", month_stream_sql.as_str()),
+    ] {
+        if let Err(err) = client.query(sql).await {
+            let err_msg = err.to_string().to_ascii_lowercase();
+            if name.contains("stream") && err_msg.contains("stream already exists") {
+                println!("TDengine {} already exists, skip", name);
+                continue;
+            }
+            eprintln!("Failed to ensure {}: {}", name, err);
+            return Err(err.into());
         }
     }
+    ensure_streams_started(client).await?;
+    ensure_origin_mapping_columns(client, &config.origin_stable_name).await?;
+
+    println!(
+        "TDengine schema ensured: origin={}, hour={}, day={}, month={}, subtable_prefix={}",
+        config.origin_stable_name,
+        config.hour_stable_name,
+        config.day_stable_name,
+        config.month_stable_name,
+        config.subtable_prefix
+    );
+    Ok(())
+}
+
+async fn upgrade_legacy_streams(client: &taos::Taos) -> anyhow::Result<()> {
+    for sql in [
+        "STOP STREAM IF EXISTS day_stream_ele",
+        "STOP STREAM IF EXISTS day_stream_st",
+        "DROP STREAM IF EXISTS day_stream_ele",
+        "DROP STREAM IF EXISTS day_stream_st",
+    ] {
+        if let Err(err) = client.query(sql).await {
+            let err_msg = err.to_string().to_ascii_lowercase();
+            if err_msg.contains("does not exist") || err_msg.contains("not exist") {
+                continue;
+            }
+            eprintln!(
+                "Failed to run legacy stream upgrade step `{}`: {}",
+                sql, err
+            );
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_streams_started(client: &taos::Taos) -> anyhow::Result<()> {
+    let streams = [
+        "hour_stream_ele",
+        "hour_stream_st",
+        "day_stream",
+        "month_stream",
+    ];
+    for stream in streams {
+        let sql = format!("START STREAM IF EXISTS {}", stream);
+        if let Err(err) = client.query(sql).await {
+            let err_msg = err.to_string().to_ascii_lowercase();
+            if err_msg.contains("stream was not stopped") {
+                println!("TDengine stream {} already running, skip start", stream);
+                continue;
+            }
+            eprintln!("Failed to start stream {}: {}", stream, err);
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_origin_mapping_columns(
+    client: &taos::Taos,
+    stable_name: &str,
+) -> anyhow::Result<()> {
+    for column in ["avg_u", "avg_uu", "avg_i"] {
+        let sql = format!("ALTER STABLE {} ADD COLUMN {} DOUBLE", stable_name, column);
+        if let Err(err) = client.query(sql).await {
+            let err_msg = err.to_string().to_ascii_lowercase();
+            if err_msg.contains("exist") || err_msg.contains("duplicate") {
+                continue;
+            }
+            eprintln!(
+                "Failed to ensure origin mapping column {}.{}: {}",
+                stable_name, column, err
+            );
+            return Err(err.into());
+        }
+    }
+    Ok(())
 }

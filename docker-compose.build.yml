@@ -16,7 +16,7 @@ services:
         cp /app/target/release/mqtt_collect /app/linux/ &&
         echo 'Build completed! Output: ./linux/mqtt_collect'
       "
-    restart: "no"
+    restart: no
 
 volumes:
   cargo-cache:
