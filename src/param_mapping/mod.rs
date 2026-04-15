@@ -118,7 +118,7 @@ static FALLBACK_ALIASES: Lazy<Vec<(&'static str, Vec<&'static str>)>> = Lazy::ne
         ("pa", vec!["pa", "PA"]),
         ("pb", vec!["pb", "PB"]),
         ("pc", vec!["pc", "PC"]),
-        ("p", vec!["p", "P"]),
+        ("p", vec!["p", "P", "三相有功功率"]),
         ("q", vec!["q", "Q"]),
         ("s", vec!["s", "S"]),
         ("fa", vec!["fa", "FA", "PFA"]),
@@ -231,4 +231,19 @@ pub async fn get_standard_field(alias: &str) -> Option<String> {
 
 pub fn get_param_mapping_sync() -> &'static HashMap<&'static str, &'static str> {
     &FALLBACK_MAPPING
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParamMappingCache;
+
+    #[test]
+    fn maps_three_phase_active_power_to_p() {
+        let cache = ParamMappingCache::new();
+
+        assert_eq!(
+            cache.get_standard_field("三相有功功率"),
+            Some("p".to_string())
+        );
+    }
 }
