@@ -43,10 +43,10 @@ pub async fn process_device_alarm(
     let (configs, source) = load_alarm_configs(device_id, device_name).await?;
 
     if configs.is_empty() {
-        println!(
-            "no active alarm configs found: device_name={}, device_id={}",
-            device_name, device_id
-        );
+        // println!(
+        //     "no active alarm configs found: device_name={}, device_id={}",
+        //     device_name, device_id
+        // );
         return Ok(());
     }
 
