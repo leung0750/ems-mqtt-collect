@@ -66,6 +66,36 @@ pub async fn get_alarm_configs_by_device(
         .map(|row| crate::alarm::AlarmConfigData {
             id: row.get("id"),
             device_id: row.get("device_id"),
+            device_name: None,
+            alarm_field: row.get("alarm_field"),
+            operator: row.get("operator"),
+            threshold: row.get("threshold"),
+        })
+        .collect();
+
+    Ok(configs)
+}
+
+pub async fn load_alarm_configs_by_device_name(
+    device_name: &str,
+) -> Result<Vec<crate::alarm::AlarmConfigData>, Box<dyn std::error::Error + Send + Sync>> {
+    let pool = mysqldb::get_pool().await?;
+
+    let sql = r#"
+        SELECT id, device_id, device_name, alarm_field, operator, threshold
+        FROM alarm_config
+        WHERE device_name = ? AND is_active = 1
+        ORDER BY id ASC
+    "#;
+
+    let rows = sqlx::query(sql).bind(device_name).fetch_all(&pool).await?;
+
+    let configs: Vec<crate::alarm::AlarmConfigData> = rows
+        .into_iter()
+        .map(|row| crate::alarm::AlarmConfigData {
+            id: row.get("id"),
+            device_id: Some(row.get("device_id")),
+            device_name: Some(row.get("device_name")),
             alarm_field: row.get("alarm_field"),
             operator: row.get("operator"),
             threshold: row.get("threshold"),
