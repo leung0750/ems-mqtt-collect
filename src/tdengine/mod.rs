@@ -53,7 +53,11 @@ pub static TDENGINE_CONFIG: OnceCell<TdengineConfig> = OnceCell::new();
 const RECONNECT_COOLDOWN_SECS: i64 = 10;
 
 pub async fn init_tdengine() -> Result<Arc<taos::Taos>, anyhow::Error> {
-    let config: TdengineConfig = conf::load_config("TDENGINE")?;
+    let mut config: TdengineConfig = conf::load_config("TDENGINE")?;
+    config.database = config.database.trim().to_string();
+    if config.database.is_empty() {
+        return Err(anyhow!("TDENGINE.database cannot be empty"));
+    }
     let _ = TDENGINE_CONFIG.set(config);
 
     let config = TDENGINE_CONFIG
@@ -123,6 +127,7 @@ pub async fn test_connection() -> Result<(), anyhow::Error> {
 }
 
 async fn build_tdengine_client(config: &TdengineConfig) -> Result<Arc<taos::Taos>, anyhow::Error> {
+    let database_identifier = quote_identifier(&config.database)?;
     let root_dsn = format!(
         "taos://{}:{}@{}:{}",
         config.username, config.password, config.host, config.port
@@ -130,7 +135,7 @@ async fn build_tdengine_client(config: &TdengineConfig) -> Result<Arc<taos::Taos
     let admin_client = taos::TaosBuilder::from_dsn(root_dsn)?.build().await?;
     let create_db_sql = format!(
         "CREATE DATABASE IF NOT EXISTS {} PRECISION 'ms' KEEP 3650",
-        config.database
+        database_identifier
     );
     admin_client.query(create_db_sql).await?;
 
@@ -140,6 +145,14 @@ async fn build_tdengine_client(config: &TdengineConfig) -> Result<Arc<taos::Taos
     );
     let app_client = taos::TaosBuilder::from_dsn(app_dsn)?.build().await?;
     Ok(Arc::new(app_client))
+}
+
+fn quote_identifier(name: &str) -> anyhow::Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("TDengine identifier cannot be empty"));
+    }
+    Ok(format!("`{}`", trimmed.replace('`', "``")))
 }
 
 fn set_tdengine_client(client: Arc<taos::Taos>) -> Result<(), anyhow::Error> {
@@ -323,7 +336,7 @@ SELECT
   FIRST(start_val) AS start_val,
   LAST(end_val) AS end_val
 FROM %%tbname
-WHERE _c0 >= _twstart AND _c0 <= _twend
+WHERE _c0 >= _twstart AND _c0 < _twend
 "#,
         config.hour_stable_name, config.day_stable_name
     );
@@ -331,8 +344,9 @@ WHERE _c0 >= _twstart AND _c0 <= _twend
     let month_stream_sql = format!(
         r#"
 CREATE STREAM IF NOT EXISTS month_stream
-PERIOD(1d)
+SLIDING(1d)
 FROM {} PARTITION BY tbname, device_id, energy_type
+STREAM_OPTIONS(FILL_HISTORY_FIRST)
 INTO {} (ts, energy, start_val, end_val)
 TAGS (
   device_id NCHAR(255) AS device_id,
@@ -340,18 +354,19 @@ TAGS (
 )
 AS
 SELECT
-  TO_TIMESTAMP(TO_CHAR(_tlocaltime, 'YYYY-MM'), 'YYYY-MM') AS ts,
+  TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM') AS ts,
   SUM(energy) AS energy,
   FIRST(start_val) AS start_val,
   LAST(end_val) AS end_val
 FROM %%tbname
-WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tlocaltime, 'YYYY-MM'), 'YYYY-MM')
-  AND _c0 < TO_TIMESTAMP(TO_CHAR(_tlocaltime + 1n, 'YYYY-MM'), 'YYYY-MM')
+WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM')
+  AND _c0 < TO_TIMESTAMP(TO_CHAR(_tcurrent_ts + 1n, 'YYYY-MM'), 'YYYY-MM')
 "#,
         config.day_stable_name, config.month_stable_name
     );
 
     upgrade_legacy_streams(client).await?;
+    upgrade_current_streams(client, config).await?;
 
     for (name, sql) in [
         ("origin stable", origin_sql.as_str()),
@@ -406,6 +421,70 @@ async fn upgrade_legacy_streams(client: &taos::Taos) -> anyhow::Result<()> {
             return Err(err.into());
         }
     }
+    Ok(())
+}
+
+async fn upgrade_current_streams(
+    client: &taos::Taos,
+    config: &TdengineConfig,
+) -> anyhow::Result<()> {
+    let checks = [
+        (
+            "day_stream",
+            vec!["where _c0 >= _twstart and _c0 <= _twend"],
+        ),
+        (
+            "month_stream",
+            vec![
+                "period(1d)",
+                "_tlocaltime",
+                "create stream if not exists month_stream",
+            ],
+        ),
+    ];
+
+    for (stream_name, legacy_patterns) in checks {
+        let sql = format!(
+            "SELECT sql FROM information_schema.ins_streams WHERE db_name = '{}' AND stream_name = '{}' LIMIT 1",
+            config.database, stream_name
+        );
+        let existing: Option<(String,)> = AsyncQueryable::query_one(client, sql).await?;
+        let Some((stream_sql,)) = existing else {
+            continue;
+        };
+
+        let normalized = stream_sql.to_ascii_lowercase();
+        let should_recreate = legacy_patterns
+            .iter()
+            .any(|pattern| normalized.contains(pattern));
+
+        if !should_recreate {
+            continue;
+        }
+
+        for action in [
+            format!("STOP STREAM IF EXISTS {}", stream_name),
+            format!("DROP STREAM IF EXISTS {}", stream_name),
+        ] {
+            if let Err(err) = client.query(&action).await {
+                let err_msg = err.to_string().to_ascii_lowercase();
+                if err_msg.contains("does not exist")
+                    || err_msg.contains("not exist")
+                    || err_msg.contains("stream was not stopped")
+                {
+                    continue;
+                }
+                eprintln!(
+                    "Failed to recreate outdated stream {} with step `{}`: {}",
+                    stream_name, action, err
+                );
+                return Err(err.into());
+            }
+        }
+
+        println!("TDengine outdated stream {} dropped for re-create", stream_name);
+    }
+
     Ok(())
 }
 
