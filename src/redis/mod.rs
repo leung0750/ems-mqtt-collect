@@ -210,3 +210,21 @@ pub async fn zadd(key: &str, score: i64, member: &str) -> RedisResult<()> {
         )))
     }
 }
+
+pub async fn brpop(key: &str, timeout_seconds: usize) -> RedisResult<Option<(String, String)>> {
+    if let Some(client) = get_redis_client() {
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        let key = namespace_key(key);
+        let result: Option<[String; 2]> = redis::cmd("BRPOP")
+            .arg(&key)
+            .arg(timeout_seconds)
+            .query_async(&mut conn)
+            .await?;
+        Ok(result.map(|[queue, value]| (queue, value)))
+    } else {
+        Err(redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "Redis client not initialized",
+        )))
+    }
+}

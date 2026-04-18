@@ -20,6 +20,8 @@ pub struct TdengineConfig {
     pub day_stable_name: String,
     #[serde(default = "default_month_stable_name")]
     pub month_stable_name: String,
+    #[serde(default = "default_tou_daily_stable_name")]
+    pub tou_daily_stable_name: String,
     #[serde(default = "default_subtable_prefix")]
     pub subtable_prefix: String,
 }
@@ -38,6 +40,10 @@ fn default_day_stable_name() -> String {
 
 fn default_month_stable_name() -> String {
     "month".to_string()
+}
+
+fn default_tou_daily_stable_name() -> String {
+    "tou_daily_usage_rollup".to_string()
 }
 
 fn default_subtable_prefix() -> String {
@@ -86,6 +92,22 @@ pub fn get_origin_stable_name() -> anyhow::Result<String> {
         .get()
         .ok_or_else(|| anyhow!("TDengine config not initialized"))?
         .origin_stable_name
+        .clone())
+}
+
+pub fn get_hour_stable_name() -> anyhow::Result<String> {
+    Ok(TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?
+        .hour_stable_name
+        .clone())
+}
+
+pub fn get_tou_daily_stable_name() -> anyhow::Result<String> {
+    Ok(TDENGINE_CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("TDengine config not initialized"))?
+        .tou_daily_stable_name
         .clone())
 }
 
@@ -272,6 +294,24 @@ CREATE STABLE IF NOT EXISTS {} (
         config.month_stable_name
     );
 
+    let tou_daily_sql = format!(
+        r#"
+CREATE STABLE IF NOT EXISTS {} (
+    ts TIMESTAMP,
+    usage DOUBLE,
+    calculated_at TIMESTAMP,
+    source_updated_at TIMESTAMP
+) TAGS (
+    device_id NCHAR(255),
+    energy_type NCHAR(32),
+    template_id BIGINT,
+    template_version_hash NCHAR(64),
+    period_key NCHAR(64)
+);
+"#,
+        config.tou_daily_stable_name
+    );
+
     let hour_ele_stream_sql = format!(
         r#"
 CREATE STREAM IF NOT EXISTS hour_stream_ele
@@ -373,6 +413,7 @@ WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM')
         ("hour stable", hour_sql.as_str()),
         ("day stable", day_sql.as_str()),
         ("month stable", month_sql.as_str()),
+        ("tou daily stable", tou_daily_sql.as_str()),
         ("hour electricity stream", hour_ele_stream_sql.as_str()),
         ("hour st stream", hour_st_stream_sql.as_str()),
         ("day stream", day_stream_sql.as_str()),
@@ -392,11 +433,12 @@ WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM')
     ensure_origin_mapping_columns(client, &config.origin_stable_name).await?;
 
     println!(
-        "TDengine schema ensured: origin={}, hour={}, day={}, month={}, subtable_prefix={}",
+        "TDengine schema ensured: origin={}, hour={}, day={}, month={}, tou_daily={}, subtable_prefix={}",
         config.origin_stable_name,
         config.hour_stable_name,
         config.day_stable_name,
         config.month_stable_name,
+        config.tou_daily_stable_name,
         config.subtable_prefix
     );
     Ok(())
@@ -482,7 +524,10 @@ async fn upgrade_current_streams(
             }
         }
 
-        println!("TDengine outdated stream {} dropped for re-create", stream_name);
+        println!(
+            "TDengine outdated stream {} dropped for re-create",
+            stream_name
+        );
     }
 
     Ok(())
