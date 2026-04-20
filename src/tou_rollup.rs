@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context};
-use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use futures::TryStreamExt;
 use once_cell::sync::Lazy;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -19,20 +19,28 @@ const BILLING_UTC_OFFSET_HOURS: i64 = 8;
 const DEFAULT_COMMAND_QUEUE_KEY: &str = "tou_rollup:command_queue";
 const DEFAULT_COMMAND_RESULT_KEY: &str = "tou_rollup:last_result";
 const DEFAULT_COMMAND_TIMEOUT_SECS: usize = 5;
+const ROLLUP_VERIFIED_MARKER: &str = "verified:v2";
+const ROLLUP_QUERY_CHUNK_DAYS: i64 = 31;
+const ROLLUP_DROP_TABLE_BATCH_SIZE: usize = 200;
+const DEFAULT_CLEANUP_HOUR: u32 = 3;
+const DEFAULT_CLEANUP_RETENTION_DAYS: i64 = 7;
 
 static RUN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static CLEANUP_LOCK: Lazy<Mutex<Option<NaiveDate>>> = Lazy::new(|| Mutex::new(None));
+static SYNC_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug)]
 struct RollupJob {
     id: i64,
     template_id: i64,
     template_version_hash: String,
+    rollup_generation: String,
     energy_type: i32,
     start_date: NaiveDate,
     end_date: NaiveDate,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct TemplatePeriod {
     period_key: String,
     start_hour: u32,
@@ -42,11 +50,57 @@ struct TemplatePeriod {
 }
 
 #[derive(Debug)]
+struct TemplatePeriodVersionRow {
+    template_id: i64,
+    start_at: NaiveDateTime,
+    end_at: Option<NaiveDateTime>,
+    period_key: String,
+    start_hour: u32,
+    start_minute: u32,
+    end_hour: u32,
+    end_minute: u32,
+    period_order: i32,
+}
+
+#[derive(Debug)]
+struct TemplateVersionRecord {
+    template_id: i64,
+    version_hash: String,
+    effective_start: NaiveDate,
+    effective_end: Option<NaiveDate>,
+    period_config_json: String,
+}
+
+#[derive(Debug)]
+struct RollupJobCandidate {
+    template_id: i64,
+    template_version_hash: String,
+    energy_type: i32,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+}
+
+#[derive(Debug)]
 struct RollupUsage {
     device: String,
     day: NaiveDate,
     period_key: String,
     usage: f64,
+}
+
+#[derive(Debug, Default)]
+struct RollupStats {
+    usage_total: f64,
+    row_count: i64,
+}
+
+#[derive(Debug)]
+struct CleanupJob {
+    id: i64,
+    template_id: i64,
+    template_version_hash: String,
+    rollup_generation: String,
+    energy_type: i32,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -67,6 +121,9 @@ pub fn spawn_worker() {
         let mut ticker = interval(Duration::from_secs(WORKER_INTERVAL_SECS));
         loop {
             ticker.tick().await;
+            if let Err(err) = run_cleanup_if_due().await {
+                eprintln!("tou rollup cleanup failed: {:#}", err);
+            }
             if let Err(err) = run_once().await {
                 eprintln!("tou rollup worker failed: {:#}", err);
             }
@@ -100,11 +157,13 @@ pub async fn run_once() -> anyhow::Result<()> {
 }
 
 async fn run_once_inner() -> anyhow::Result<()> {
+    sync_tou_metadata_and_jobs().await?;
+
     let pool = mysqldb::get_pool().await?;
     let stale_minutes = stale_running_job_minutes();
     let select_sql = format!(
         r#"
-        SELECT id, template_id, template_version_hash, energy_type,
+        SELECT id, template_id, template_version_hash, COALESCE(rollup_generation, '') AS rollup_generation, energy_type,
                DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
                DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date
         FROM tou_rollup_job
@@ -122,6 +181,7 @@ async fn run_once_inner() -> anyhow::Result<()> {
         r#"
         UPDATE tou_rollup_job
         SET status = 'RUNNING',
+            rollup_generation = COALESCE(NULLIF(rollup_generation, ''), ?),
             locked_at = NOW(),
             attempts = attempts + 1,
             progress = 0,
@@ -147,7 +207,14 @@ async fn run_once_inner() -> anyhow::Result<()> {
 
         for row in rows {
             let id: i64 = row.try_get("id")?;
+            let raw_generation: String = row.try_get("rollup_generation")?;
+            let rollup_generation = if raw_generation.trim().is_empty() {
+                generate_rollup_generation(id)
+            } else {
+                raw_generation
+            };
             let affected = sqlx::query(&claim_sql)
+                .bind(&rollup_generation)
                 .bind(id)
                 .execute(&pool)
                 .await?
@@ -160,14 +227,17 @@ async fn run_once_inner() -> anyhow::Result<()> {
                 id,
                 template_id: row.try_get("template_id")?,
                 template_version_hash: row.try_get("template_version_hash")?,
+                rollup_generation,
                 energy_type: row.try_get("energy_type")?,
                 start_date: parse_date(row.try_get::<String, _>("start_date")?)?,
                 end_date: parse_date(row.try_get::<String, _>("end_date")?)?,
             };
 
-            if let Err(err) = process_job(&job).await {
-                let message = truncate_error(&format!("{:#}", err));
-                sqlx::query(
+            let stats = match process_job(&job).await {
+                Ok(stats) => stats,
+                Err(err) => {
+                    let message = truncate_error(&format!("{:#}", err));
+                    sqlx::query(
                     r#"
                     UPDATE tou_rollup_job
                     SET status = CASE WHEN attempts >= ? THEN 'PAUSED' ELSE 'FAILED' END,
@@ -183,12 +253,16 @@ async fn run_once_inner() -> anyhow::Result<()> {
                 .bind(job.id)
                 .execute(&pool)
                 .await?;
-                continue;
-            }
+                    continue;
+                }
+            };
 
             sqlx::query(
-                "UPDATE tou_rollup_job SET status = 'DONE', progress = 100, locked_at = NULL, error_message = NULL, next_retry_at = NULL WHERE id = ?",
+                "UPDATE tou_rollup_job SET status = 'DONE', progress = 100, locked_at = NULL, error_message = ?, next_retry_at = NULL, verified_at = NOW(), usage_total = ?, row_count = ? WHERE id = ?",
             )
+            .bind(ROLLUP_VERIFIED_MARKER)
+            .bind(stats.usage_total)
+            .bind(stats.row_count)
             .bind(job.id)
             .execute(&pool)
             .await?;
@@ -196,6 +270,287 @@ async fn run_once_inner() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn sync_tou_metadata_and_jobs() -> anyhow::Result<()> {
+    let _guard = SYNC_LOCK.lock().await;
+    let pool = mysqldb::get_pool().await?;
+
+    let synced_versions = sync_template_versions(&pool).await?;
+    let (created_jobs, reset_jobs) = sync_rollup_jobs(&pool).await?;
+
+    if synced_versions > 0 || created_jobs > 0 || reset_jobs > 0 {
+        println!(
+            "tou rollup sync finished: synced_versions={}, created_jobs={}, reset_jobs={}",
+            synced_versions, created_jobs, reset_jobs
+        );
+    }
+
+    Ok(())
+}
+
+async fn sync_template_versions(pool: &sqlx::MySqlPool) -> anyhow::Result<usize> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            tt.id AS template_id,
+            DATE_FORMAT(ttp.start_time, '%Y-%m-%d %H:%i:%s') AS version_start,
+            COALESCE(DATE_FORMAT(ttp.end_time, '%Y-%m-%d %H:%i:%s'), '') AS version_end,
+            ttp.period_key,
+            CAST(ttp.start_hour AS UNSIGNED) AS start_hour,
+            CAST(ttp.start_minute AS UNSIGNED) AS start_minute,
+            CAST(ttp.end_hour AS UNSIGNED) AS end_hour,
+            CAST(ttp.end_minute AS UNSIGNED) AS end_minute,
+            ttp.period_order
+        FROM time_template tt
+        INNER JOIN time_template_period ttp ON ttp.template_id = tt.id
+        WHERE tt.template_type = 'TOU'
+        ORDER BY tt.id ASC, ttp.start_time ASC, ttp.end_time ASC, ttp.period_order ASC, ttp.id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut grouped: HashMap<(i64, String, String), Vec<TemplatePeriodVersionRow>> = HashMap::new();
+    for row in rows {
+        let template_id: i64 = row.try_get("template_id")?;
+        let version_start: String = row.try_get("version_start")?;
+        let version_end: String = row.try_get("version_end")?;
+        let start_at = parse_mysql_naive_datetime(&version_start)?;
+        let end_at = if version_end.trim().is_empty() {
+            None
+        } else {
+            Some(parse_mysql_naive_datetime(&version_end)?)
+        };
+
+        grouped
+            .entry((template_id, version_start, version_end))
+            .or_default()
+            .push(TemplatePeriodVersionRow {
+                template_id,
+                start_at,
+                end_at,
+                period_key: row.try_get("period_key")?,
+                start_hour: row.try_get("start_hour")?,
+                start_minute: row.try_get("start_minute")?,
+                end_hour: row.try_get("end_hour")?,
+                end_minute: row.try_get("end_minute")?,
+                period_order: row.try_get("period_order")?,
+            });
+    }
+
+    let mut upserted = 0usize;
+    for ((_template_id, _start, _end), mut rows) in grouped {
+        rows.sort_by(|left, right| {
+            left.period_order
+                .cmp(&right.period_order)
+                .then_with(|| left.period_key.cmp(&right.period_key))
+        });
+
+        let periods: Vec<TemplatePeriod> = rows
+            .iter()
+            .map(|row| TemplatePeriod {
+                period_key: row.period_key.clone(),
+                start_hour: row.start_hour,
+                start_minute: row.start_minute,
+                end_hour: row.end_hour,
+                end_minute: row.end_minute,
+            })
+            .collect();
+
+        if periods.is_empty() {
+            continue;
+        }
+
+        let first = rows
+            .first()
+            .ok_or_else(|| anyhow!("template version group is unexpectedly empty"))?;
+        let period_config_json = serde_json::to_string(&periods)?;
+        let version_hash = format!(
+            "{:x}",
+            md5::compute(
+                format!(
+                    "{}|{}|{}|{}",
+                    first.template_id,
+                    first.start_at.format("%Y-%m-%d %H:%M:%S"),
+                    first
+                        .end_at
+                        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_default(),
+                    period_config_json
+                )
+                .as_bytes()
+            )
+        );
+
+        let record = TemplateVersionRecord {
+            template_id: first.template_id,
+            version_hash,
+            effective_start: first.start_at.date(),
+            effective_end: first.end_at.map(resolve_effective_end_date),
+            period_config_json,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO tou_template_version (
+                template_id,
+                version_hash,
+                effective_start,
+                effective_end,
+                period_config_json,
+                status
+            ) VALUES (?, ?, ?, ?, ?, 1)
+            ON DUPLICATE KEY UPDATE
+                effective_start = VALUES(effective_start),
+                effective_end = VALUES(effective_end),
+                period_config_json = VALUES(period_config_json),
+                status = 1,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(record.template_id)
+        .bind(&record.version_hash)
+        .bind(record.effective_start.format("%Y-%m-%d").to_string())
+        .bind(
+            record
+                .effective_end
+                .map(|value| value.format("%Y-%m-%d").to_string()),
+        )
+        .bind(&record.period_config_json)
+        .execute(pool)
+        .await?;
+        upserted += 1;
+    }
+
+    Ok(upserted)
+}
+
+async fn sync_rollup_jobs(pool: &sqlx::MySqlPool) -> anyhow::Result<(usize, usize)> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT
+            tv.template_id AS template_id,
+            tv.version_hash AS template_version_hash,
+            ps.energy_type_id AS energy_type,
+            DATE_FORMAT(GREATEST(tv.effective_start, pa.start_date), '%Y-%m-%d') AS overlap_start,
+            DATE_FORMAT(
+                LEAST(
+                    COALESCE(tv.effective_end, '2099-12-31'),
+                    COALESCE(pa.end_date, '2099-12-31')
+                ),
+                '%Y-%m-%d'
+            ) AS overlap_end
+        FROM tou_template_version tv
+        INNER JOIN price_scheme ps
+            ON ps.time_template_id = tv.template_id
+           AND ps.billing_mode = 'TOU'
+           AND ps.status = 1
+        INNER JOIN price_assignment pa
+            ON pa.scheme_id = ps.id
+           AND pa.status = 1
+        WHERE tv.status = 1
+          AND GREATEST(tv.effective_start, pa.start_date) <= LEAST(
+                COALESCE(tv.effective_end, '2099-12-31'),
+                COALESCE(pa.end_date, '2099-12-31')
+          )
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut created = 0usize;
+    let mut reset = 0usize;
+    for row in rows {
+        let candidate = RollupJobCandidate {
+            template_id: row.try_get("template_id")?,
+            template_version_hash: row.try_get("template_version_hash")?,
+            energy_type: row.try_get("energy_type")?,
+            start_date: parse_date(row.try_get::<String, _>("overlap_start")?)?,
+            end_date: parse_date(row.try_get::<String, _>("overlap_end")?)?,
+        };
+
+        if candidate.end_date < candidate.start_date {
+            continue;
+        }
+
+        let existing = sqlx::query(
+            r#"
+            SELECT id, status
+            FROM tou_rollup_job
+            WHERE template_id = ?
+              AND template_version_hash = ?
+              AND energy_type = ?
+              AND start_date = ?
+              AND end_date = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(candidate.template_id)
+        .bind(&candidate.template_version_hash)
+        .bind(candidate.energy_type)
+        .bind(candidate.start_date.format("%Y-%m-%d").to_string())
+        .bind(candidate.end_date.format("%Y-%m-%d").to_string())
+        .fetch_optional(pool)
+        .await?;
+
+        match existing {
+            None => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO tou_rollup_job (
+                        template_id,
+                        template_version_hash,
+                        energy_type,
+                        start_date,
+                        end_date,
+                        status,
+                        progress,
+                        attempts
+                    ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, 0)
+                    "#,
+                )
+                .bind(candidate.template_id)
+                .bind(&candidate.template_version_hash)
+                .bind(candidate.energy_type)
+                .bind(candidate.start_date.format("%Y-%m-%d").to_string())
+                .bind(candidate.end_date.format("%Y-%m-%d").to_string())
+                .execute(pool)
+                .await?;
+                created += 1;
+            }
+            Some(existing_row) => {
+                let existing_id: i64 = existing_row.try_get("id")?;
+                let existing_status: String = existing_row.try_get("status")?;
+                let normalized_status = existing_status.trim().to_ascii_uppercase();
+                if matches!(normalized_status.as_str(), "FAILED" | "PAUSED" | "CLEANED") {
+                    sqlx::query(
+                        r#"
+                        UPDATE tou_rollup_job
+                        SET status = 'PENDING',
+                            progress = 0,
+                            error_message = NULL,
+                            next_retry_at = NULL,
+                            locked_at = NULL,
+                            rollup_generation = NULL,
+                            verified_at = NULL,
+                            usage_total = NULL,
+                            row_count = NULL,
+                            updated_at = NOW()
+                        WHERE id = ?
+                        "#,
+                    )
+                    .bind(existing_id)
+                    .execute(pool)
+                    .await?;
+                    reset += 1;
+                }
+            }
+        }
+    }
+
+    Ok((created, reset))
 }
 
 async fn handle_command(
@@ -296,7 +651,7 @@ async fn write_command_result(
     }
 }
 
-async fn process_job(job: &RollupJob) -> anyhow::Result<()> {
+async fn process_job(job: &RollupJob) -> anyhow::Result<RollupStats> {
     if job.end_date < job.start_date {
         return Err(anyhow!("invalid job date range"));
     }
@@ -315,7 +670,7 @@ async fn process_job(job: &RollupJob) -> anyhow::Result<()> {
             "tou rollup job {} skipped: no devices for energy_type={}",
             job.id, job.energy_type
         );
-        return Ok(());
+        return Ok(RollupStats::default());
     }
 
     let client = tdengine::get_tdengine_client()
@@ -323,32 +678,40 @@ async fn process_job(job: &RollupJob) -> anyhow::Result<()> {
     let hour_stable = tdengine::get_hour_stable_name()?;
     let tou_stable = tdengine::get_tou_daily_stable_name()?;
 
-    let mut current = job.start_date;
+    let mut stats = RollupStats::default();
     let mut processed_days = 0;
     let mut pending_usages: Vec<RollupUsage> = Vec::with_capacity(ROLLUP_INSERT_BATCH_SIZE);
-    while current <= job.end_date {
-        let day_usages = query_day_usage_by_period(
+    let mut chunk_start = job.start_date;
+    while chunk_start <= job.end_date {
+        let chunk_end = std::cmp::min(
+            chunk_start + ChronoDuration::days(ROLLUP_QUERY_CHUNK_DAYS - 1),
+            job.end_date,
+        );
+        let range_usages = query_range_usage_by_period(
             client.as_ref(),
             &hour_stable,
             &devices,
             job.energy_type,
-            current,
+            chunk_start,
+            chunk_end,
             &periods,
         )
         .await?;
-        for usage in day_usages {
+        for usage in range_usages {
+            stats.usage_total += usage.usage;
+            stats.row_count += 1;
             pending_usages.push(usage);
-        }
-        if pending_usages.len() >= ROLLUP_INSERT_BATCH_SIZE {
-            flush_rollup_usages(client.as_ref(), &tou_stable, job, &mut pending_usages).await?;
+            if pending_usages.len() >= ROLLUP_INSERT_BATCH_SIZE {
+                flush_rollup_usages(client.as_ref(), &tou_stable, job, &mut pending_usages).await?;
+            }
         }
         flush_rollup_usages(client.as_ref(), &tou_stable, job, &mut pending_usages).await?;
-        processed_days += 1;
+        processed_days += (chunk_end - chunk_start).num_days() + 1;
         update_progress(job.id, processed_days, total_days(job)).await?;
-        current += ChronoDuration::days(1);
+        chunk_start = chunk_end + ChronoDuration::days(1);
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 async fn load_template_periods(job: &RollupJob) -> anyhow::Result<Vec<TemplatePeriod>> {
@@ -391,32 +754,35 @@ async fn load_energy_devices(energy_type: i32) -> anyhow::Result<Vec<String>> {
     Ok(devices)
 }
 
-async fn query_day_usage_by_period(
+async fn query_range_usage_by_period(
     client: &taos::Taos,
     hour_stable: &str,
     devices: &HashSet<String>,
     energy_type: i32,
-    day: NaiveDate,
+    start_day: NaiveDate,
+    end_day: NaiveDate,
     periods: &[TemplatePeriod],
 ) -> anyhow::Result<Vec<RollupUsage>> {
-    let start = day.and_time(NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"));
-    let end = start + ChronoDuration::days(1);
+    let start = start_day.and_time(NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"));
+    let end = (end_day + ChronoDuration::days(1))
+        .and_time(NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"));
 
     let sql = format!(
-        "SELECT CAST(ts AS VARCHAR(64)), device_id, CAST(energy AS VARCHAR(64)) FROM {} WHERE energy_type = {} AND ts >= {} AND ts < {}",
-        hour_stable,
+		"SELECT CAST(ts AS VARCHAR(64)), device_id, CAST(energy AS VARCHAR(64)) FROM {} WHERE energy_type = {} AND ts >= {} AND ts < {}",
+		hour_stable,
         quote_tdengine_string(&energy_type.to_string()),
         quote_tdengine_string(&format_tdengine_query_ts(start)),
         quote_tdengine_string(&format_tdengine_query_ts(end)),
     );
     let mut rows = client.query(sql).await?;
     let records: Vec<(String, String, String)> = rows.deserialize().try_collect().await?;
-    let mut usage_by_device_period: HashMap<(String, String), f64> = HashMap::new();
+    let mut usage_by_device_period: HashMap<(String, NaiveDate, String), f64> = HashMap::new();
     for (raw_ts, device, raw_usage) in records {
         if !devices.contains(&device) {
             continue;
         }
         let bucket_start = parse_tdengine_ts(&raw_ts)?;
+        let day = bucket_start.date();
         let usage = raw_usage.trim().parse::<f64>().with_context(|| {
             format!(
                 "parse TDengine hourly usage failed: device={}, energy_type={}, day={}, ts={}, raw={}",
@@ -426,6 +792,9 @@ async fn query_day_usage_by_period(
         if usage <= 0.0 {
             continue;
         }
+        if day < start_day || day > end_day {
+            continue;
+        }
         let bucket_end = bucket_start + ChronoDuration::hours(1);
         for period in periods {
             let overlap = period_overlap_seconds(bucket_start, bucket_end, period)?;
@@ -433,13 +802,13 @@ async fn query_day_usage_by_period(
                 continue;
             }
             let period_usage = usage * overlap as f64 / 3600.0;
-            let key = (device.clone(), period.period_key.clone());
+            let key = (device.clone(), day, period.period_key.clone());
             *usage_by_device_period.entry(key).or_insert(0.0) += period_usage;
         }
     }
 
     let mut usages = Vec::with_capacity(usage_by_device_period.len());
-    for ((device, period_key), usage) in usage_by_device_period {
+    for ((device, day, period_key), usage) in usage_by_device_period {
         if usage <= 0.0 {
             continue;
         }
@@ -451,6 +820,127 @@ async fn query_day_usage_by_period(
         });
     }
     Ok(usages)
+}
+
+async fn run_cleanup_if_due() -> anyhow::Result<()> {
+    let now = chrono::Local::now();
+    if now.hour() != cleanup_hour() {
+        return Ok(());
+    }
+
+    let today = now.date_naive();
+    let mut last_cleanup = CLEANUP_LOCK.lock().await;
+    if last_cleanup.as_ref() == Some(&today) {
+        return Ok(());
+    }
+    *last_cleanup = Some(today);
+    drop(last_cleanup);
+
+    cleanup_old_rollup_generations().await
+}
+
+async fn cleanup_old_rollup_generations() -> anyhow::Result<()> {
+    let pool = mysqldb::get_pool().await?;
+    let retention_days = cleanup_retention_days();
+    let rows = sqlx::query(
+        r#"
+        SELECT j.id, j.template_id, j.template_version_hash, j.rollup_generation, j.energy_type
+        FROM tou_rollup_job j
+        WHERE j.status = 'DONE'
+          AND j.verified_at IS NOT NULL
+          AND j.rollup_generation IS NOT NULL
+          AND j.rollup_generation <> ''
+          AND j.verified_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+          AND EXISTS (
+              SELECT 1
+              FROM tou_rollup_job newer
+              WHERE newer.template_id = j.template_id
+                AND newer.template_version_hash = j.template_version_hash
+                AND newer.energy_type = j.energy_type
+                AND newer.start_date <= j.start_date
+                AND newer.end_date >= j.end_date
+                AND newer.status = 'DONE'
+                AND newer.verified_at IS NOT NULL
+                AND newer.rollup_generation IS NOT NULL
+                AND newer.rollup_generation <> ''
+                AND newer.verified_at > j.verified_at
+          )
+        ORDER BY j.verified_at ASC
+        LIMIT 20
+        "#,
+    )
+    .bind(retention_days)
+    .fetch_all(&pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let client = tdengine::get_tdengine_client()
+        .ok_or_else(|| anyhow!("TDengine client not initialized"))?;
+    for row in rows {
+        let cleanup_job = CleanupJob {
+            id: row.try_get("id")?,
+            template_id: row.try_get("template_id")?,
+            template_version_hash: row.try_get("template_version_hash")?,
+            rollup_generation: row.try_get("rollup_generation")?,
+            energy_type: row.try_get("energy_type")?,
+        };
+        cleanup_rollup_generation(client.as_ref(), &cleanup_job).await?;
+        sqlx::query(
+            "UPDATE tou_rollup_job SET status = 'CLEANED', error_message = 'cleaned old rollup generation', updated_at = NOW() WHERE id = ?",
+        )
+        .bind(cleanup_job.id)
+        .execute(&pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_rollup_generation(client: &taos::Taos, job: &CleanupJob) -> anyhow::Result<()> {
+    let devices: HashSet<String> = load_energy_devices(job.energy_type)
+        .await?
+        .into_iter()
+        .collect();
+    let periods = load_template_periods(&RollupJob {
+        id: job.id,
+        template_id: job.template_id,
+        template_version_hash: job.template_version_hash.clone(),
+        rollup_generation: job.rollup_generation.clone(),
+        energy_type: job.energy_type,
+        start_date: NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+        end_date: NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+    })
+    .await?;
+
+    let mut table_names: Vec<String> = Vec::with_capacity(devices.len() * periods.len());
+    for device in &devices {
+        for period in &periods {
+            table_names.push(rollup_subtable_name(
+                device,
+                job.energy_type,
+                job.template_id,
+                &job.template_version_hash,
+                &job.rollup_generation,
+                &period.period_key,
+            ));
+        }
+    }
+    for chunk in table_names.chunks(ROLLUP_DROP_TABLE_BATCH_SIZE) {
+        let sql = format!("DROP TABLE IF EXISTS {}", chunk.join(", "));
+        if let Err(err) = client.query(sql).await {
+            let message = err.to_string().to_ascii_lowercase();
+            if !message.contains("does not exist")
+                && !message.contains("not exist")
+                && !message.contains("unknown table")
+            {
+                return Err(err.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn period_overlap_seconds(
@@ -508,13 +998,14 @@ async fn flush_rollup_usages(
             job.energy_type,
             job.template_id,
             &job.template_version_hash,
+            &job.rollup_generation,
             &item.period_key,
         );
         let ts = item
             .day
             .and_time(NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"));
         sql.push_str(&format!(
-            "{} USING {} TAGS ({}, {}, {}, {}, {}) (ts, usage, calculated_at, source_updated_at) VALUES ({}, {:.6}, {}, {}) ",
+            "{} USING {} TAGS ({}, {}, {}, {}, {}, {}) (ts, usage, calculated_at, source_updated_at) VALUES ({}, {:.6}, {}, {}) ",
             table_name,
             tou_stable,
             quote_tdengine_string(&item.device),
@@ -522,6 +1013,7 @@ async fn flush_rollup_usages(
             job.template_id,
             quote_tdengine_string(&job.template_version_hash),
             quote_tdengine_string(&item.period_key),
+            quote_tdengine_string(&job.rollup_generation),
             quote_tdengine_string(&format_ts(ts)),
             item.usage,
             quote_tdengine_string(&format_ts(now)),
@@ -549,6 +1041,18 @@ async fn update_progress(job_id: i64, processed_days: i64, total_days: i64) -> a
 
 fn parse_date(raw: String) -> anyhow::Result<NaiveDate> {
     NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").map_err(|err| err.into())
+}
+
+fn parse_mysql_naive_datetime(raw: &str) -> anyhow::Result<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S").map_err(|err| err.into())
+}
+
+fn resolve_effective_end_date(end_at: NaiveDateTime) -> NaiveDate {
+    if end_at.time() == NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid") {
+        (end_at - ChronoDuration::seconds(1)).date()
+    } else {
+        end_at.date()
+    }
 }
 
 fn total_days(job: &RollupJob) -> i64 {
@@ -609,13 +1113,18 @@ fn rollup_subtable_name(
     energy_type: i32,
     template_id: i64,
     version_hash: &str,
+    rollup_generation: &str,
     period_key: &str,
 ) -> String {
     let raw = format!(
-        "{}|{}|{}|{}|{}",
-        device, energy_type, template_id, version_hash, period_key
+        "{}|{}|{}|{}|{}|{}",
+        device, energy_type, template_id, version_hash, rollup_generation, period_key
     );
     format!("tou_{:x}", md5::compute(raw.as_bytes()))
+}
+
+fn generate_rollup_generation(job_id: i64) -> String {
+    format!("job_{}_{}", job_id, chrono::Utc::now().timestamp_millis())
 }
 
 fn truncate_error(value: &str) -> String {
@@ -640,4 +1149,20 @@ fn max_retry_attempts() -> i32 {
         .and_then(|raw| raw.trim().parse::<i32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(3)
+}
+
+fn cleanup_hour() -> u32 {
+    std::env::var("TOU_ROLLUP_CLEANUP_HOUR")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|value| *value <= 23)
+        .unwrap_or(DEFAULT_CLEANUP_HOUR)
+}
+
+fn cleanup_retention_days() -> i64 {
+    std::env::var("TOU_ROLLUP_CLEANUP_RETENTION_DAYS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(DEFAULT_CLEANUP_RETENTION_DAYS)
 }

@@ -306,7 +306,8 @@ CREATE STABLE IF NOT EXISTS {} (
     energy_type NCHAR(32),
     template_id BIGINT,
     template_version_hash NCHAR(64),
-    period_key NCHAR(64)
+    period_key NCHAR(64),
+    rollup_generation NCHAR(64)
 );
 "#,
         config.tou_daily_stable_name
@@ -314,14 +315,14 @@ CREATE STABLE IF NOT EXISTS {} (
 
     let hour_ele_stream_sql = format!(
         r#"
-CREATE STREAM IF NOT EXISTS hour_stream_ele
+CREATE STREAM IF NOT EXISTS hour_stream_ele_v2
 INTERVAL(1h) SLIDING(1h)
 FROM {} PARTITION BY tbname, device_id, energy_type
 STREAM_OPTIONS(FILL_HISTORY_FIRST|PRE_FILTER(energy_type = '1'))
 INTO {} (ts, energy, start_val, end_val)
 TAGS (
-  device_id NCHAR(255) AS device_id,
-  energy_type NCHAR(32) AS energy_type
+  device_id NCHAR(255) AS CAST(device_id AS NCHAR(255)),
+  energy_type NCHAR(32) AS CAST(energy_type AS NCHAR(32))
 )
 AS
 SELECT
@@ -337,14 +338,14 @@ WHERE _c0 >= _twstart AND _c0 <= _twend
 
     let hour_st_stream_sql = format!(
         r#"
-CREATE STREAM IF NOT EXISTS hour_stream_st
+CREATE STREAM IF NOT EXISTS hour_stream_st_v2
 INTERVAL(1h) SLIDING(1h)
 FROM {} PARTITION BY tbname, device_id, energy_type
 STREAM_OPTIONS(FILL_HISTORY_FIRST|PRE_FILTER(st IS NOT NULL))
 INTO {} (ts, energy, start_val, end_val)
 TAGS (
-  device_id NCHAR(255) AS device_id,
-  energy_type NCHAR(32) AS energy_type
+  device_id NCHAR(255) AS CAST(device_id AS NCHAR(255)),
+  energy_type NCHAR(32) AS CAST(energy_type AS NCHAR(32))
 )
 AS
 SELECT
@@ -360,14 +361,14 @@ WHERE _c0 >= _twstart AND _c0 <= _twend
 
     let day_stream_sql = format!(
         r#"
-CREATE STREAM IF NOT EXISTS day_stream
+CREATE STREAM IF NOT EXISTS day_stream_v2
 INTERVAL(1d) SLIDING(1d)
 FROM {} PARTITION BY tbname, device_id, energy_type
 STREAM_OPTIONS(FILL_HISTORY_FIRST)
 INTO {} (ts, energy, start_val, end_val)
 TAGS (
-  device_id NCHAR(255) AS device_id,
-  energy_type NCHAR(32) AS energy_type
+  device_id NCHAR(255) AS CAST(device_id AS NCHAR(255)),
+  energy_type NCHAR(32) AS CAST(energy_type AS NCHAR(32))
 )
 AS
 SELECT
@@ -383,14 +384,14 @@ WHERE _c0 >= _twstart AND _c0 < _twend
 
     let month_stream_sql = format!(
         r#"
-CREATE STREAM IF NOT EXISTS month_stream
+CREATE STREAM IF NOT EXISTS month_stream_v2
 SLIDING(1d)
 FROM {} PARTITION BY tbname, device_id, energy_type
 STREAM_OPTIONS(FILL_HISTORY_FIRST)
 INTO {} (ts, energy, start_val, end_val)
 TAGS (
-  device_id NCHAR(255) AS device_id,
-  energy_type NCHAR(32) AS energy_type
+  device_id NCHAR(255) AS CAST(device_id AS NCHAR(255)),
+  energy_type NCHAR(32) AS CAST(energy_type AS NCHAR(32))
 )
 AS
 SELECT
@@ -446,8 +447,16 @@ WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM')
 
 async fn upgrade_legacy_streams(client: &taos::Taos) -> anyhow::Result<()> {
     for sql in [
+        "STOP STREAM IF EXISTS hour_stream_ele",
+        "STOP STREAM IF EXISTS hour_stream_st",
+        "STOP STREAM IF EXISTS day_stream",
+        "STOP STREAM IF EXISTS month_stream",
         "STOP STREAM IF EXISTS day_stream_ele",
         "STOP STREAM IF EXISTS day_stream_st",
+        "DROP STREAM IF EXISTS hour_stream_ele",
+        "DROP STREAM IF EXISTS hour_stream_st",
+        "DROP STREAM IF EXISTS day_stream",
+        "DROP STREAM IF EXISTS month_stream",
         "DROP STREAM IF EXISTS day_stream_ele",
         "DROP STREAM IF EXISTS day_stream_st",
     ] {
@@ -472,15 +481,15 @@ async fn upgrade_current_streams(
 ) -> anyhow::Result<()> {
     let checks = [
         (
-            "day_stream",
+            "day_stream_v2",
             vec!["where _c0 >= _twstart and _c0 <= _twend"],
         ),
         (
-            "month_stream",
+            "month_stream_v2",
             vec![
                 "period(1d)",
                 "_tlocaltime",
-                "create stream if not exists month_stream",
+                "create stream if not exists month_stream_v2",
             ],
         ),
     ];
@@ -535,13 +544,13 @@ async fn upgrade_current_streams(
 
 async fn ensure_streams_started(client: &taos::Taos) -> anyhow::Result<()> {
     let streams = [
-        "hour_stream_ele",
-        "hour_stream_st",
-        "day_stream",
-        "month_stream",
+        "hour_stream_ele_v2",
+        "hour_stream_st_v2",
+        "day_stream_v2",
+        "month_stream_v2",
     ];
     for stream in streams {
-        let sql = format!("START STREAM IF EXISTS {}", stream);
+        let sql = format!("START STREAM IF EXISTS IGNORE UNTREATED {}", stream);
         if let Err(err) = client.query(sql).await {
             let err_msg = err.to_string().to_ascii_lowercase();
             if err_msg.contains("stream was not stopped") {
