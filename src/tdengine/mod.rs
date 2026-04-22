@@ -20,6 +20,8 @@ pub struct TdengineConfig {
     pub day_stable_name: String,
     #[serde(default = "default_month_stable_name")]
     pub month_stable_name: String,
+    #[serde(default = "default_manual_hour_override_stable_name")]
+    pub manual_hour_override_stable_name: String,
     #[serde(default = "default_tou_daily_stable_name")]
     pub tou_daily_stable_name: String,
     #[serde(default = "default_subtable_prefix")]
@@ -40,6 +42,10 @@ fn default_day_stable_name() -> String {
 
 fn default_month_stable_name() -> String {
     "month".to_string()
+}
+
+fn default_manual_hour_override_stable_name() -> String {
+    "manual_hour_override".to_string()
 }
 
 fn default_tou_daily_stable_name() -> String {
@@ -294,6 +300,21 @@ CREATE STABLE IF NOT EXISTS {} (
         config.month_stable_name
     );
 
+    let manual_hour_override_sql = format!(
+        r#"
+CREATE STABLE IF NOT EXISTS {} (
+    ts TIMESTAMP,
+    energy DOUBLE,
+    base_energy DOUBLE,
+    updated_at TIMESTAMP
+) TAGS (
+    device_id NCHAR(255),
+    energy_type NCHAR(32)
+);
+"#,
+        config.manual_hour_override_stable_name
+    );
+
     let tou_daily_sql = format!(
         r#"
 CREATE STABLE IF NOT EXISTS {} (
@@ -414,6 +435,10 @@ WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM')
         ("hour stable", hour_sql.as_str()),
         ("day stable", day_sql.as_str()),
         ("month stable", month_sql.as_str()),
+        (
+            "manual hour override stable",
+            manual_hour_override_sql.as_str(),
+        ),
         ("tou daily stable", tou_daily_sql.as_str()),
         ("hour electricity stream", hour_ele_stream_sql.as_str()),
         ("hour st stream", hour_st_stream_sql.as_str()),
@@ -434,11 +459,12 @@ WHERE _c0 >= TO_TIMESTAMP(TO_CHAR(_tcurrent_ts, 'YYYY-MM'), 'YYYY-MM')
     ensure_origin_mapping_columns(client, &config.origin_stable_name).await?;
 
     println!(
-        "TDengine schema ensured: origin={}, hour={}, day={}, month={}, tou_daily={}, subtable_prefix={}",
+        "TDengine schema ensured: origin={}, hour={}, day={}, month={}, manual_hour_override={}, tou_daily={}, subtable_prefix={}",
         config.origin_stable_name,
         config.hour_stable_name,
         config.day_stable_name,
         config.month_stable_name,
+        config.manual_hour_override_stable_name,
         config.tou_daily_stable_name,
         config.subtable_prefix
     );

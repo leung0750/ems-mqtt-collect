@@ -1,7 +1,11 @@
 use crate::conf;
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
-use sqlx::{Error as SqlxError, MySqlPool};
+use sqlx::{
+    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    ConnectOptions, Error as SqlxError, MySqlPool,
+};
+use std::str::FromStr;
 use tokio::sync::Mutex;
 
 pub type DbResult<T> = Result<T, SqlxError>;
@@ -61,7 +65,18 @@ async fn connect() -> DbResult<MySqlPool> {
     );
     println!("Attempting to connect...");
 
-    let pool = MySqlPool::connect(&database_url).await?;
+    let options = MySqlConnectOptions::from_str(&database_url)?;
+    let pool = MySqlPoolOptions::new()
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET time_zone = '+08:00'")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options.disable_statement_logging())
+        .await?;
     sqlx::query("SELECT 1").execute(&pool).await?;
 
     println!("Database Pool initialized successfully!");

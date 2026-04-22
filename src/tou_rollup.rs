@@ -21,6 +21,7 @@ const DEFAULT_COMMAND_RESULT_KEY: &str = "tou_rollup:last_result";
 const DEFAULT_COMMAND_TIMEOUT_SECS: usize = 5;
 const ROLLUP_VERIFIED_MARKER: &str = "verified:v2";
 const ROLLUP_QUERY_CHUNK_DAYS: i64 = 31;
+const ROLLUP_JOB_WINDOW_DAYS: i64 = 31;
 const ROLLUP_DROP_TABLE_BATCH_SIZE: usize = 200;
 const DEFAULT_CLEANUP_HOUR: u32 = 3;
 const DEFAULT_CLEANUP_RETENTION_DAYS: i64 = 7;
@@ -252,7 +253,7 @@ async fn run_once_inner() -> anyhow::Result<()> {
                 .bind(max_retry_attempts())
                 .bind(job.id)
                 .execute(&pool)
-                .await?;
+                    .await?;
                     continue;
                 }
             };
@@ -433,11 +434,18 @@ async fn sync_rollup_jobs(pool: &sqlx::MySqlPool) -> anyhow::Result<(usize, usiz
             tv.template_id AS template_id,
             tv.version_hash AS template_version_hash,
             ps.energy_type_id AS energy_type,
-            DATE_FORMAT(GREATEST(tv.effective_start, pa.start_date), '%Y-%m-%d') AS overlap_start,
+            DATE_FORMAT(
+                LEAST(
+                    GREATEST(tv.effective_start, pa.start_date),
+                    CURRENT_DATE()
+                ),
+                '%Y-%m-%d'
+            ) AS overlap_start,
             DATE_FORMAT(
                 LEAST(
                     COALESCE(tv.effective_end, '2099-12-31'),
-                    COALESCE(pa.end_date, '2099-12-31')
+                    COALESCE(pa.end_date, '2099-12-31'),
+                    CURRENT_DATE()
                 ),
                 '%Y-%m-%d'
             ) AS overlap_end
@@ -450,9 +458,13 @@ async fn sync_rollup_jobs(pool: &sqlx::MySqlPool) -> anyhow::Result<(usize, usiz
             ON pa.scheme_id = ps.id
            AND pa.status = 1
         WHERE tv.status = 1
-          AND GREATEST(tv.effective_start, pa.start_date) <= LEAST(
+          AND LEAST(
+                GREATEST(tv.effective_start, pa.start_date),
+                CURRENT_DATE()
+          ) <= LEAST(
                 COALESCE(tv.effective_end, '2099-12-31'),
-                COALESCE(pa.end_date, '2099-12-31')
+                COALESCE(pa.end_date, '2099-12-31'),
+                CURRENT_DATE()
           )
         "#,
     )
@@ -474,7 +486,7 @@ async fn sync_rollup_jobs(pool: &sqlx::MySqlPool) -> anyhow::Result<(usize, usiz
             continue;
         }
 
-        let existing = sqlx::query(
+        let exact_candidate = sqlx::query(
             r#"
             SELECT id, status
             FROM tou_rollup_job
@@ -495,35 +507,96 @@ async fn sync_rollup_jobs(pool: &sqlx::MySqlPool) -> anyhow::Result<(usize, usiz
         .fetch_optional(pool)
         .await?;
 
-        match existing {
-            None => {
+        if let Some(existing) = exact_candidate {
+            let existing_id: i64 = existing.try_get("id")?;
+            let normalized_status = existing
+                .try_get::<String, _>("status")?
+                .trim()
+                .to_ascii_uppercase();
+            if matches!(normalized_status.as_str(), "FAILED" | "PAUSED" | "CLEANED") {
                 sqlx::query(
                     r#"
-                    INSERT INTO tou_rollup_job (
-                        template_id,
-                        template_version_hash,
-                        energy_type,
-                        start_date,
-                        end_date,
-                        status,
-                        progress,
-                        attempts
-                    ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, 0)
+                    UPDATE tou_rollup_job
+                    SET status = 'PENDING',
+                        progress = 0,
+                        error_message = NULL,
+                        next_retry_at = NULL,
+                        locked_at = NULL,
+                        rollup_generation = NULL,
+                        verified_at = NULL,
+                        usage_total = NULL,
+                        row_count = NULL,
+                        updated_at = NOW()
+                    WHERE id = ?
                     "#,
                 )
-                .bind(candidate.template_id)
-                .bind(&candidate.template_version_hash)
-                .bind(candidate.energy_type)
-                .bind(candidate.start_date.format("%Y-%m-%d").to_string())
-                .bind(candidate.end_date.format("%Y-%m-%d").to_string())
+                .bind(existing_id)
                 .execute(pool)
                 .await?;
-                created += 1;
+                reset += 1;
             }
-            Some(existing_row) => {
-                let existing_id: i64 = existing_row.try_get("id")?;
-                let existing_status: String = existing_row.try_get("status")?;
-                let normalized_status = existing_status.trim().to_ascii_uppercase();
+            continue;
+        }
+
+        let coverage_row = sqlx::query(
+            r#"
+            SELECT DATE_FORMAT(MAX(LEAST(end_date, ?)), '%Y-%m-%d') AS latest_covered_end
+            FROM tou_rollup_job
+            WHERE template_id = ?
+              AND template_version_hash = ?
+              AND energy_type = ?
+              AND start_date <= ?
+            "#,
+        )
+        .bind(candidate.end_date.format("%Y-%m-%d").to_string())
+        .bind(candidate.template_id)
+        .bind(&candidate.template_version_hash)
+        .bind(candidate.energy_type)
+        .bind(candidate.end_date.format("%Y-%m-%d").to_string())
+        .fetch_one(pool)
+        .await?;
+
+        let latest_covered_end = coverage_row
+            .try_get::<Option<String>, _>("latest_covered_end")?
+            .map(parse_date)
+            .transpose()?;
+
+        let mut next_start = latest_covered_end
+            .map(|value| std::cmp::max(candidate.start_date, value + ChronoDuration::days(1)))
+            .unwrap_or(candidate.start_date);
+        while next_start <= candidate.end_date {
+            let chunk_end = std::cmp::min(
+                candidate.end_date,
+                next_start + ChronoDuration::days(ROLLUP_JOB_WINDOW_DAYS - 1),
+            );
+
+            let exact_existing = sqlx::query(
+                r#"
+                SELECT id, status
+                FROM tou_rollup_job
+                WHERE template_id = ?
+                  AND template_version_hash = ?
+                  AND energy_type = ?
+                  AND start_date = ?
+                  AND end_date = ?
+                ORDER BY id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(candidate.template_id)
+            .bind(&candidate.template_version_hash)
+            .bind(candidate.energy_type)
+            .bind(next_start.format("%Y-%m-%d").to_string())
+            .bind(chunk_end.format("%Y-%m-%d").to_string())
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some(existing) = exact_existing {
+                let existing_id: i64 = existing.try_get("id")?;
+                let normalized_status = existing
+                    .try_get::<String, _>("status")?
+                    .trim()
+                    .to_ascii_uppercase();
                 if matches!(normalized_status.as_str(), "FAILED" | "PAUSED" | "CLEANED") {
                     sqlx::query(
                         r#"
@@ -546,7 +619,74 @@ async fn sync_rollup_jobs(pool: &sqlx::MySqlPool) -> anyhow::Result<(usize, usiz
                     .await?;
                     reset += 1;
                 }
+            } else {
+                let result = sqlx::query(
+                    r#"
+                    INSERT INTO tou_rollup_job (
+                        template_id,
+                        template_version_hash,
+                        energy_type,
+                        start_date,
+                        end_date,
+                        status,
+                        progress,
+                        attempts
+                    ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, 0)
+                    ON DUPLICATE KEY UPDATE
+                        status = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN 'PENDING'
+                            ELSE status
+                        END,
+                        progress = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN 0
+                            ELSE progress
+                        END,
+                        error_message = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE error_message
+                        END,
+                        next_retry_at = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE next_retry_at
+                        END,
+                        locked_at = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE locked_at
+                        END,
+                        rollup_generation = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE rollup_generation
+                        END,
+                        verified_at = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE verified_at
+                        END,
+                        usage_total = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE usage_total
+                        END,
+                        row_count = CASE
+                            WHEN UPPER(TRIM(status)) IN ('FAILED', 'PAUSED', 'CLEANED') THEN NULL
+                            ELSE row_count
+                        END,
+                        updated_at = NOW()
+                    "#,
+                )
+                .bind(candidate.template_id)
+                .bind(&candidate.template_version_hash)
+                .bind(candidate.energy_type)
+                .bind(next_start.format("%Y-%m-%d").to_string())
+                .bind(chunk_end.format("%Y-%m-%d").to_string())
+                .execute(pool)
+                .await?;
+                if result.rows_affected() == 1 {
+                    created += 1;
+                } else if result.rows_affected() > 1 {
+                    reset += 1;
+                }
             }
+
+            next_start = chunk_end + ChronoDuration::days(1);
         }
     }
 
